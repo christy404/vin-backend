@@ -1,146 +1,115 @@
-require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
+const cors = require("cors");
 const PDFDocument = require("pdfkit");
 const fs = require("fs");
 const path = require("path");
-const nodemailer = require("nodemailer");
+require("dotenv").config();
 
 const app = express();
+app.use(cors());
 app.use(express.json());
-app.use("/reports", express.static("reports"));
 
-// ---------------------
-// Mailjet Transporter
-// ---------------------
-const transporter = nodemailer.createTransport({
-  host: "in-v3.mailjet.com",
-  port: 587,
-  secure: false,
-  auth: {
-    user: process.env.MJ_API_KEY,
-    pass: process.env.MJ_SECRET_KEY,
-  },
-});
+// Serve reports folder
+app.use("/reports", express.static(path.join(__dirname, "reports")));
 
-// Verify SMTP
-transporter.verify((err) => {
-  if (err) console.log("Mailjet Error:", err);
-  else console.log("Mailjet SMTP Ready");
-});
+// MAILJET SETUP
+const mailjet = require("node-mailjet").apiConnect(
+  process.env.MJ_API_KEY,
+  process.env.MJ_SECRET_KEY
+);
 
-// ---------------------
-// PDF Generator
-// ---------------------
-function generatePDF(vinData, filePath) {
-  return new Promise((resolve, reject) => {
-    const doc = new PDFDocument({ margin: 40 });
-    const stream = fs.createWriteStream(filePath);
-    doc.pipe(stream);
-
-    doc.fontSize(20).text("VEHICLE HISTORY REPORT", { align: "center" });
-    doc.moveDown();
-
-    doc.fontSize(12).text(`VIN: ${vinData.VIN}`);
-    doc.text(`Make: ${vinData.Make}`);
-    doc.text(`Model: ${vinData.Model}`);
-    doc.text(`Year: ${vinData.ModelYear}`);
-    doc.text(`Body Style: ${vinData.BodyClass}`);
-    doc.text(`Manufacturer: ${vinData.Manufacturer}`);
-    doc.text(`Engine: ${vinData.EngineCylinders}`);
-    doc.text(`Country: ${vinData.PlantCountry}`);
-
-    doc.moveDown();
-    doc.text("RAW VIN DATA:");
-    doc.fontSize(10).text(JSON.stringify(vinData, null, 2));
-
-    doc.end();
-    stream.on("finish", resolve);
-    stream.on("error", reject);
-  });
-}
-
-// ---------------------
-// Email Sender
-// ---------------------
-async function sendEmail(to, subject, text, attachmentPath) {
-  return transporter.sendMail({
-    from: process.env.FROM_EMAIL,
-    to: to,
-    subject: subject,
-    text: text,
-    attachments: [
-      {
-        filename: path.basename(attachmentPath),
-        path: attachmentPath,
-      },
-    ],
-  });
-}
-
-// ---------------------
-// VIN Route + Email
-// ---------------------
+// VIN API ROUTE
 app.get("/api/vin/:vin", async (req, res) => {
   const vin = req.params.vin;
-  const email = req.query.email;
+  const email = req.query.email || null;
 
   try {
-    // Fetch VIN data
+    // 1. Fetch VIN details using NHTSA API (free)
     const response = await axios.get(
       `https://vpic.nhtsa.dot.gov/api/vehicles/decodevinvalues/${vin}?format=json`
     );
 
-    const vinData = response.data.Results[0];
+    const data = response.data.Results[0];
 
-    if (!fs.existsSync("./reports")) fs.mkdirSync("./reports");
+    // 2. Generate PDF
+    const filename = `${vin}.pdf`;
+    const filepath = path.join(__dirname, "reports", filename);
 
-    const filePath = `./reports/${vin}.pdf`;
+    const pdf = new PDFDocument();
+    pdf.pipe(fs.createWriteStream(filepath));
 
-    // Create PDF
-    await generatePDF(vinData, filePath);
+    pdf.fontSize(22).text("Vehicle History Report", { align: "center" });
+    pdf.moveDown();
+
+    pdf.fontSize(14).text(`VIN: ${vin}`);
+    pdf.text(`Make: ${data.Make}`);
+    pdf.text(`Model: ${data.Model}`);
+    pdf.text(`Year: ${data.ModelYear}`);
+    pdf.text(`Manufacturer: ${data.Manufacturer}`);
+    pdf.text(`Body Class: ${data.BodyClass}`);
+    pdf.text(`Engine: ${data.EngineModel}`);
+    pdf.text(`Fuel Type: ${data.FuelTypePrimary}`);
+    pdf.text(`Country: ${data.PlantCountry}`);
+
+    pdf.end();
 
     let emailStatus = null;
 
+    // 3. SEND EMAIL (only if email provided)
     if (email) {
       try {
-        await sendEmail(
-          email,
-          `Your Vehicle History Report (${vin})`,
-          `Hello,\n\nYour vehicle history report is attached.\n\nRegards,\nVIN Report Service`,
-          filePath
-        );
+        const pdfBuffer = fs.readFileSync(filepath);
 
-        emailStatus = { sent: true };
+        const send = await mailjet.post("send", { version: "v3.1" }).request({
+          Messages: [
+            {
+              From: {
+                Email: process.env.MJ_SENDER,
+                Name: "VIN Report Service",
+              },
+              To: [
+                {
+                  Email: email,
+                },
+              ],
+              Subject: `Your Vehicle Report for VIN ${vin}`,
+              TextPart: "Your PDF report is attached.",
+              Attachments: [
+                {
+                  ContentType: "application/pdf",
+                  Filename: filename,
+                  Base64Content: pdfBuffer.toString("base64"),
+                },
+              ],
+            },
+          ],
+        });
+
+        emailStatus = { ok: true, message: "Mailjet email sent" };
       } catch (err) {
-        emailStatus = { sent: false, error: err.message };
+        console.error("Mailjet Error:", err.message);
+        emailStatus = { ok: false, message: "Mailjet send failed" };
       }
     }
 
+    // RESPONSE JSON
     res.json({
       success: true,
-      pdf: `https://YOUR-RENDER-URL/reports/${vin}.pdf`,
+      message: "PDF generated successfully",
+      download: `http://localhost:3000/reports/${filename}`,
       email: emailStatus,
     });
-  } catch (err) {
-    console.log("ERR", err);
+  } catch (error) {
+    console.error("VIN Lookup Error:", error);
+
     res.status(500).json({
       success: false,
-      message: "VIN lookup or email failed",
-      error: err.message,
+      message: "Failed to process VIN",
     });
   }
 });
 
-// ---------------------
-// Default Route
-// ---------------------
-app.get("/", (req, res) => {
-  res.send("VIN API Running…");
-});
-
-// ---------------------
-// Start Server
-// ---------------------
+// START SERVER
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
