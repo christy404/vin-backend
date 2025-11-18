@@ -1,98 +1,146 @@
+require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
-const cors = require("cors");
-const bodyParser = require("body-parser");
 const PDFDocument = require("pdfkit");
 const fs = require("fs");
+const path = require("path");
 const nodemailer = require("nodemailer");
-require("dotenv").config();
 
 const app = express();
-app.use(cors());
-app.use(bodyParser.json());
+app.use(express.json());
 app.use("/reports", express.static("reports"));
 
-// Mailtrap transporter
+// ---------------------
+// Mailjet Transporter
+// ---------------------
 const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: Number(process.env.SMTP_PORT),
+  host: "in-v3.mailjet.com",
+  port: 587,
   secure: false,
   auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS
-  }
+    user: process.env.MJ_API_KEY,
+    pass: process.env.MJ_SECRET_KEY,
+  },
 });
 
-// VIN API Route
+// Verify SMTP
+transporter.verify((err) => {
+  if (err) console.log("Mailjet Error:", err);
+  else console.log("Mailjet SMTP Ready");
+});
+
+// ---------------------
+// PDF Generator
+// ---------------------
+function generatePDF(vinData, filePath) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ margin: 40 });
+    const stream = fs.createWriteStream(filePath);
+    doc.pipe(stream);
+
+    doc.fontSize(20).text("VEHICLE HISTORY REPORT", { align: "center" });
+    doc.moveDown();
+
+    doc.fontSize(12).text(`VIN: ${vinData.VIN}`);
+    doc.text(`Make: ${vinData.Make}`);
+    doc.text(`Model: ${vinData.Model}`);
+    doc.text(`Year: ${vinData.ModelYear}`);
+    doc.text(`Body Style: ${vinData.BodyClass}`);
+    doc.text(`Manufacturer: ${vinData.Manufacturer}`);
+    doc.text(`Engine: ${vinData.EngineCylinders}`);
+    doc.text(`Country: ${vinData.PlantCountry}`);
+
+    doc.moveDown();
+    doc.text("RAW VIN DATA:");
+    doc.fontSize(10).text(JSON.stringify(vinData, null, 2));
+
+    doc.end();
+    stream.on("finish", resolve);
+    stream.on("error", reject);
+  });
+}
+
+// ---------------------
+// Email Sender
+// ---------------------
+async function sendEmail(to, subject, text, attachmentPath) {
+  return transporter.sendMail({
+    from: process.env.FROM_EMAIL,
+    to: to,
+    subject: subject,
+    text: text,
+    attachments: [
+      {
+        filename: path.basename(attachmentPath),
+        path: attachmentPath,
+      },
+    ],
+  });
+}
+
+// ---------------------
+// VIN Route + Email
+// ---------------------
 app.get("/api/vin/:vin", async (req, res) => {
   const vin = req.params.vin;
   const email = req.query.email;
-  const pdfPath = `reports/${vin}.pdf`;
 
   try {
+    // Fetch VIN data
     const response = await axios.get(
-      `https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues/${vin}?format=json`
+      `https://vpic.nhtsa.dot.gov/api/vehicles/decodevinvalues/${vin}?format=json`
     );
 
-    const data = response.data.Results[0];
+    const vinData = response.data.Results[0];
 
-    // Generate PDF
-    const doc = new PDFDocument();
-    doc.pipe(fs.createWriteStream(pdfPath));
+    if (!fs.existsSync("./reports")) fs.mkdirSync("./reports");
 
-    doc.fontSize(22).text("Vehicle History Report", { underline: true });
-    doc.moveDown();
+    const filePath = `./reports/${vin}.pdf`;
 
-    doc.fontSize(14)
-      .text(`VIN: ${vin}`)
-      .text(`Make: ${data.Make}`)
-      .text(`Model: ${data.Model}`)
-      .text(`Year: ${data.ModelYear}`)
-      .moveDown();
+    // Create PDF
+    await generatePDF(vinData, filePath);
 
-    doc.text("Full Data:", { underline: true }).moveDown();
-    Object.entries(data).forEach(([key, value]) => {
-      doc.text(`${key}: ${value}`);
-    });
+    let emailStatus = null;
 
-    doc.end();
-
-    // If email provided → send email
-    let emailResult = null;
     if (email) {
-      await transporter.sendMail({
-        from: process.env.FROM_EMAIL,
-        to: email,
-        subject: `Your Vehicle History Report - ${vin}`,
-        text: "Your PDF report is attached.",
-        attachments: [
-          {
-            filename: `${vin}.pdf`,
-            path: pdfPath
-          }
-        ]
-      });
+      try {
+        await sendEmail(
+          email,
+          `Your Vehicle History Report (${vin})`,
+          `Hello,\n\nYour vehicle history report is attached.\n\nRegards,\nVIN Report Service`,
+          filePath
+        );
 
-      emailResult = { ok: true, message: "Email sent" };
+        emailStatus = { sent: true };
+      } catch (err) {
+        emailStatus = { sent: false, error: err.message };
+      }
     }
 
     res.json({
       success: true,
-      message: "PDF generated successfully",
-      download: `https://your-render-url.onrender.com/${pdfPath}`,
-      email: emailResult
+      pdf: `https://YOUR-RENDER-URL/reports/${vin}.pdf`,
+      email: emailStatus,
     });
-
-  } catch (error) {
-    console.log(error);
-    res.json({
+  } catch (err) {
+    console.log("ERR", err);
+    res.status(500).json({
       success: false,
-      message: "Error processing VIN",
-      error: error.message
+      message: "VIN lookup or email failed",
+      error: err.message,
     });
   }
 });
 
-app.listen(3000, () => {
-  console.log("Server running on port 3000");
+// ---------------------
+// Default Route
+// ---------------------
+app.get("/", (req, res) => {
+  res.send("VIN API Running…");
 });
+
+// ---------------------
+// Start Server
+// ---------------------
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
