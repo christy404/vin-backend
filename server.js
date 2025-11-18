@@ -4,9 +4,7 @@ const cors = require("cors");
 const PDFDocument = require("pdfkit");
 const fs = require("fs");
 const path = require("path");
-
-// ✅ REMOVE dotenv for Render deployment
-// require("dotenv").config();
+require("dotenv").config();
 
 const app = express();
 app.use(cors());
@@ -17,79 +15,104 @@ app.use("/reports", express.static(path.join(__dirname, "reports")));
 
 // MAILJET SETUP
 const mailjet = require("node-mailjet").apiConnect(
-    process.env.MJ_API_KEY,
-    process.env.MJ_SECRET_KEY
+  process.env.MJ_API_KEY,
+  process.env.MJ_SECRET_KEY
 );
 
 // VIN API ROUTE
 app.get("/api/vin/:vin", async (req, res) => {
-    const vin = req.params.vin;
-    const email = req.query.email || null;
+  const vin = req.params.vin;
+  const email = req.query.email || null;
 
-    try {
-        // Fetch VIN details
-        const response = await axios.get(
-            `https://vpic.nhtsa.dot.gov/api/vehicles/decodevinvalues/${vin}?format=json`
-        );
+  try {
+    // 1. Fetch VIN details using NHTSA API (free)
+    const response = await axios.get(
+      `https://vpic.nhtsa.dot.gov/api/vehicles/decodevinvalues/${vin}?format=json`
+    );
 
-        const data = response.data.Results[0];
+    const data = response.data.Results[0];
 
-        // Create PDF file path
-        const filePath = path.join(__dirname, "reports", `${vin}.pdf`);
-        const pdf = new PDFDocument();
-        pdf.pipe(fs.createWriteStream(filePath));
+    // 2. Generate PDF
+    const pdfPath = path.join(__dirname, "reports", `${vin}.pdf`);
 
-        pdf.fontSize(20).text("Vehicle Report", { align: "center" });
-        pdf.moveDown();
-        pdf.fontSize(12).text(JSON.stringify(data, null, 2));
+    const doc = new PDFDocument();
+    doc.pipe(fs.createWriteStream(pdfPath));
 
-        pdf.end();
+    doc.fontSize(20).text("Vehicle History Report", { underline: true });
+    doc.moveDown();
 
-        // Email sending (optional)
-        let emailResult = null;
-        if (email) {
-            const mailRequest = mailjet.post("send", { version: "v3.1" }).request({
-                Messages: [
-                    {
-                        From: {
-                            Email: process.env.MJ_SENDER,
-                            Name: "VIN Reports"
-                        },
-                        To: [
-                            {
-                                Email: email
-                            }
-                        ],
-                        Subject: "Your Vehicle PDF Report",
-                        TextPart: "Attached is your VIN report.",
-                        Attachments: [
-                            {
-                                ContentType: "application/pdf",
-                                Filename: `${vin}.pdf`,
-                                Base64Content: fs.readFileSync(filePath).toString("base64")
-                            }
-                        ]
-                    }
-                ]
-            });
+    doc.fontSize(12).text(`VIN: ${vin}`);
+    doc.text(`Make: ${data.Make}`);
+    doc.text(`Model: ${data.Model}`);
+    doc.text(`Year: ${data.ModelYear}`);
+    doc.text(`Body Type: ${data.BodyClass}`);
+    doc.text(`Engine: ${data.EngineCylinders} cylinders`);
+    doc.text(`Manufacturer: ${data.Manufacturer}`);
+    doc.text(`Plant Country: ${data.PlantCountry}`);
+    doc.moveDown();
 
-            await mailRequest;
-            emailResult = { ok: true, message: "Email sent" };
-        }
+    doc.text("Full Raw Data:", { underline: true });
+    doc.moveDown();
 
-        res.json({
-            success: true,
-            message: "PDF generated successfully",
-            download: `https://yourapp.onrender.com/reports/${vin}.pdf`,
-            email: emailResult || null
-        });
+    Object.keys(data).forEach((key) => {
+      if (data[key]) doc.text(`${key}: ${data[key]}`);
+    });
 
-    } catch (error) {
-        console.error(error);
-        res.json({ success: false, error: error.message });
+    doc.end();
+
+    // 3. If no email, return only PDF link
+    if (!email) {
+      return res.json({
+        success: true,
+        message: "PDF generated",
+        download: `${req.protocol}://${req.get("host")}/reports/${vin}.pdf`,
+        email: null
+      });
     }
+
+    // 4. Send Email via Mailjet
+    const emailData = await mailjet.post("send", { version: "v3.1" }).request({
+      Messages: [
+        {
+          From: {
+            Email: process.env.MJ_SENDER,
+            Name: "VIN Report Service"
+          },
+          To: [
+            {
+              Email: email
+            }
+          ],
+          Subject: `Your VIN Report - ${vin}`,
+          TextPart: "Attached is your vehicle report PDF.",
+          HTMLPart: `<h3>Your Vehicle Report</h3>
+                     <p>VIN: <b>${vin}</b></p>
+                     <p>Download here:</p>
+                     <a href="${req.protocol}://${req.get("host")}/reports/${vin}.pdf">
+                        Click to download PDF
+                     </a>`
+        }
+      ]
+    });
+
+    return res.json({
+      success: true,
+      message: "PDF generated successfully",
+      download: `${req.protocol}://${req.get("host")}/reports/${vin}.pdf`,
+      email: { ok: true, message: "Email sent successfully" }
+    });
+  } catch (error) {
+    console.error(error);
+    return res.json({
+      success: false,
+      message: "VIN lookup or email failed",
+      error: error.message
+    });
+  }
 });
 
-// Start server
+// SERVER START
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Server started on port", PORT));
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
